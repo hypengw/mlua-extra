@@ -9,13 +9,24 @@ license = "MIT"
 base64 = "0.22"
 mlua = { version = "0.10", features = ["lua54", "vendored", "send", "async", "serialize"] }
 reqwest = { version = "0.12", default-features = false, features = [
+    "cookies",
     "rustls-tls",
     "gzip",
     "json",
+    "multipart",
 ] }
+cookie_store = { version = "0.22", default-features = false, features = [
+    "public_suffix",
+    "serde_json",
+] }
+getrandom = "0.3"
 scraper = "0.21"
 serde = "1.0"
 serde_json = "1.0"
 serde_urlencoded = "0.7"
+tokio = { version = "1", features = ["time"] }
 url = "2"
 log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -30,6 +30,16 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     )?;
 
     t.set(
+        "decode_component",
+        lua.create_function(|_, s: String| {
+            let encoded = format!("value={s}");
+            Ok(url::form_urlencoded::parse(encoded.as_bytes())
+                .find_map(|(key, value)| (key == "value").then(|| value.into_owned()))
+                .unwrap_or_default())
+        })?,
+    )?;
+
+    t.set(
         "host",
         lua.create_function(|_, u: String| {
             Ok(Url::parse(&u)

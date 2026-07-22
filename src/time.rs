@@ -1,5 +1,5 @@
 use mlua::prelude::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
@@ -20,6 +20,13 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs())
+        })?,
+    )?;
+    t.set(
+        "sleep",
+        lua.create_async_function(|_, millis: u64| async move {
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            Ok(())
         })?,
     )?;
     Ok(t)

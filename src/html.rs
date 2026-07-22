@@ -57,3 +57,29 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
 
     Ok(t)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_accepts_selector_lists_and_preserves_attributes() {
+        let lua = Lua::new();
+        let module = create_module(&lua).unwrap();
+        let query = module.get::<LuaFunction>("query").unwrap();
+        let elements = query
+            .call::<LuaTable>((
+                r#"<button id="account"></button>
+                    <div class="option add selected" id="active"></div>
+                    <div class="option" id="inactive"></div>"#,
+                "#account, #active, #missing",
+            ))
+            .unwrap();
+
+        assert_eq!(elements.raw_len(), 2);
+        let active = elements.get::<LuaTable>(2).unwrap();
+        let attrs = active.get::<LuaTable>("attrs").unwrap();
+        assert_eq!(attrs.get::<String>("id").unwrap(), "active");
+        assert_eq!(attrs.get::<String>("class").unwrap(), "option add selected");
+    }
+}

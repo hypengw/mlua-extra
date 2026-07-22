@@ -1,23 +1,13 @@
 use crate::util::to_lua;
 use mlua::prelude::*;
+use reqwest::cookie::CookieStore as ReqwestCookieStore;
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
-
-pub fn default(user_agent: &str) -> LuaHttpClient {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .user_agent(user_agent.to_owned())
-                .build()
-                .expect("build reqwest client")
-        })
-        .clone();
-    LuaHttpClient::new(client)
-}
 
 fn header_map_to_table(lua: &Lua, headers: &HeaderMap) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
@@ -41,13 +31,175 @@ fn table_to_header_map(t: &LuaTable) -> LuaResult<HeaderMap> {
     Ok(map)
 }
 
+fn table_to_multipart_form(t: &LuaTable) -> LuaResult<reqwest::multipart::Form> {
+    let mut form = reqwest::multipart::Form::new();
+    for pair in t.pairs::<String, LuaValue>() {
+        let (key, value) = pair?;
+        let value = match value {
+            LuaValue::String(value) => value.to_str()?.to_owned(),
+            LuaValue::Integer(value) => value.to_string(),
+            LuaValue::Number(value) => value.to_string(),
+            LuaValue::Boolean(value) => value.to_string(),
+            _ => return Err(mlua::Error::runtime("multipart values must be scalar")),
+        };
+        form = form.text(key, value);
+    }
+    Ok(form)
+}
+
 pub trait CookieHeaderProvider: Send + Sync {
     fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue>;
 }
 
+#[derive(Debug)]
+pub struct SessionCookieStore {
+    inner: RwLock<cookie_store::CookieStore>,
+    revision: AtomicU64,
+    clean_revision: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCookieSnapshot {
+    pub value: String,
+    pub revision: u64,
+}
+
+impl Default for SessionCookieStore {
+    fn default() -> Self {
+        Self {
+            inner: RwLock::new(cookie_store::CookieStore::default()),
+            revision: AtomicU64::new(0),
+            clean_revision: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SessionCookieStore {
+    fn read(&self) -> RwLockReadGuard<'_, cookie_store::CookieStore> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, cookie_store::CookieStore> {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn advance_revision(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.revision() != self.clean_revision.load(Ordering::Acquire)
+    }
+
+    pub fn mark_clean(&self, revision: u64) -> bool {
+        self.clean_revision.store(revision, Ordering::Release);
+        self.revision() == revision
+    }
+
+    pub fn snapshot(&self) -> Result<SessionCookieSnapshot, cookie_store::Error> {
+        let store = self.read();
+        let revision = self.revision();
+        let unexpired = cookie_store::CookieStore::from_cookies(
+            store.iter_unexpired().cloned().map(Ok::<_, Infallible>),
+            false,
+        )
+        .expect("infallible cookie snapshot copy");
+        let mut value = Vec::new();
+        cookie_store::serde::json::save_incl_expired_and_nonpersistent(&unexpired, &mut value)?;
+        Ok(SessionCookieSnapshot {
+            value: String::from_utf8(value).expect("cookie_store JSON is UTF-8"),
+            revision,
+        })
+    }
+
+    pub fn restore(&self, snapshot: &str) -> Result<(), cookie_store::Error> {
+        let restored = cookie_store::serde::json::load(snapshot.as_bytes())?;
+        let mut store = self.write();
+        *store = restored;
+        let revision = self.advance_revision();
+        self.clean_revision.store(revision, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn cookie(&self, url: &reqwest::Url, name: &str) -> Option<String> {
+        self.read()
+            .get_request_values(url)
+            .find_map(|(cookie_name, value)| (cookie_name == name).then(|| value.to_owned()))
+    }
+
+    pub fn insert(
+        &self,
+        url: &reqwest::Url,
+        cookie: &str,
+    ) -> Result<(), cookie_store::CookieError> {
+        let mut store = self.write();
+        store.parse(cookie, url)?;
+        self.advance_revision();
+        Ok(())
+    }
+
+    pub fn clear(&self) {
+        let mut store = self.write();
+        if store.iter_any().next().is_some() {
+            store.clear();
+            self.advance_revision();
+        }
+    }
+}
+
+impl ReqwestCookieStore for SessionCookieStore {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &HeaderValue>,
+        url: &reqwest::Url,
+    ) {
+        let mut store = self.write();
+        let mut changed = false;
+        for cookie in cookie_headers.filter_map(|header| {
+            let value = header.to_str().ok()?;
+            cookie_store::RawCookie::parse(value.to_owned())
+                .ok()
+                .map(cookie_store::RawCookie::into_owned)
+        }) {
+            changed |= store.insert_raw(&cookie, url).is_ok();
+        }
+        if changed {
+            self.advance_revision();
+        }
+    }
+
+    fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
+        let value = self
+            .read()
+            .get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        (!value.is_empty())
+            .then(|| HeaderValue::from_str(&value).ok())
+            .flatten()
+    }
+}
+
+impl CookieHeaderProvider for SessionCookieStore {
+    fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
+        ReqwestCookieStore::cookies(self, url)
+    }
+}
+
+#[derive(Clone)]
 pub struct LuaHttpClient {
     client: reqwest::Client,
     cookie_provider: Option<Arc<dyn CookieHeaderProvider>>,
+    session_store: Option<Arc<SessionCookieStore>>,
 }
 
 impl LuaHttpClient {
@@ -55,6 +207,7 @@ impl LuaHttpClient {
         Self {
             client,
             cookie_provider: None,
+            session_store: None,
         }
     }
 
@@ -65,6 +218,39 @@ impl LuaHttpClient {
         Self {
             client,
             cookie_provider: Some(cookie_provider),
+            session_store: None,
+        }
+    }
+
+    pub fn with_session(client: reqwest::Client, store: Arc<SessionCookieStore>) -> Self {
+        let cookie_provider: Arc<dyn CookieHeaderProvider> = store.clone();
+        Self {
+            client,
+            cookie_provider: Some(cookie_provider),
+            session_store: Some(store),
+        }
+    }
+
+    pub fn cookie(&self, url: &str, name: &str) -> LuaResult<Option<String>> {
+        let url = reqwest::Url::parse(url).map_err(mlua::Error::external)?;
+        Ok(self
+            .session_store
+            .as_ref()
+            .and_then(|store| store.cookie(&url, name)))
+    }
+
+    pub fn set_cookie(&self, url: &str, cookie: &str) -> LuaResult<()> {
+        let url = reqwest::Url::parse(url).map_err(mlua::Error::external)?;
+        let store = self
+            .session_store
+            .as_ref()
+            .ok_or_else(|| mlua::Error::runtime("HTTP client has no cookie store"))?;
+        store.insert(&url, cookie).map_err(mlua::Error::external)
+    }
+
+    pub fn clear_cookies(&self) {
+        if let Some(store) = &self.session_store {
+            store.clear();
         }
     }
 
@@ -98,6 +284,16 @@ impl LuaUserData for LuaHttpClient {
         methods.add_method("post", |_, this, url: String| Ok(this.post(url)));
         methods.add_method("put", |_, this, url: String| Ok(this.put(url)));
         methods.add_method("delete", |_, this, url: String| Ok(this.delete(url)));
+        methods.add_method("cookie", |_, this, (url, name): (String, String)| {
+            this.cookie(&url, &name)
+        });
+        methods.add_method("set_cookie", |_, this, (url, cookie): (String, String)| {
+            this.set_cookie(&url, &cookie)
+        });
+        methods.add_method("clear_cookies", |_, this, ()| {
+            this.clear_cookies();
+            Ok(())
+        });
     }
 }
 
@@ -186,6 +382,12 @@ impl LuaUserData for LuaRequestBuilder {
             ud.borrow_mut::<LuaRequestBuilder>()?.map(|b| b.form(&t))?;
             Ok(ud)
         });
+        methods.add_function_mut("multipart", |_, (ud, t): (LuaAnyUserData, LuaTable)| {
+            let form = table_to_multipart_form(&t)?;
+            ud.borrow_mut::<LuaRequestBuilder>()?
+                .map(|builder| builder.multipart(form))?;
+            Ok(ud)
+        });
         methods.add_function_mut("json", |_, (ud, v): (LuaAnyUserData, LuaValue)| {
             ud.borrow_mut::<LuaRequestBuilder>()?.map(|b| b.json(&v))?;
             Ok(ud)
@@ -249,6 +451,9 @@ impl LuaUserData for LuaResponse {
                 .map(|r| r.status().is_success())
                 .unwrap_or(false))
         });
+        methods.add_method("url", |_, this, ()| {
+            Ok(this.0.as_ref().map(|r| r.url().to_string()))
+        });
         methods.add_method("headers", |lua, this, ()| match this.0.as_ref() {
             Some(r) => header_map_to_table(lua, r.headers()),
             None => lua.create_table(),
@@ -301,4 +506,215 @@ fn merge_cookie_header(stored_cookie: &str, req_cookie: &str) -> String {
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn header(value: &str) -> HeaderValue {
+        HeaderValue::from_str(value).unwrap()
+    }
+
+    fn session() -> (LuaHttpClient, Arc<SessionCookieStore>) {
+        let store = Arc::new(SessionCookieStore::default());
+        let client = reqwest::Client::builder()
+            .user_agent("mlua-extra-test")
+            .cookie_provider(store.clone())
+            .build()
+            .unwrap();
+        (LuaHttpClient::with_session(client, store.clone()), store)
+    }
+
+    #[test]
+    fn session_cookie_store_obeys_scope_and_supports_named_access() {
+        let store = SessionCookieStore::default();
+        let origin = reqwest::Url::parse("https://example.com/login").unwrap();
+        let headers = [
+            header("secure_token=token; Domain=example.com; Path=/; Secure; HttpOnly"),
+            header("scoped=value; Path=/workshop"),
+            header("expired=value; Path=/; Max-Age=0"),
+        ];
+        ReqwestCookieStore::set_cookies(&store, &mut headers.iter(), &origin);
+        assert!(store.is_dirty());
+
+        let workshop = reqwest::Url::parse("https://example.com/workshop/item").unwrap();
+        let other_site = reqwest::Url::parse("https://example.net/").unwrap();
+        let insecure = reqwest::Url::parse("http://example.com/workshop/item").unwrap();
+        assert_eq!(
+            store.cookie(&workshop, "secure_token").as_deref(),
+            Some("token")
+        );
+        assert_eq!(store.cookie(&workshop, "scoped").as_deref(), Some("value"));
+        assert_eq!(store.cookie(&workshop, "expired"), None);
+        assert_eq!(store.cookie(&other_site, "secure_token"), None);
+        assert_eq!(store.cookie(&insecure, "secure_token"), None);
+
+        store.clear();
+        assert_eq!(store.cookie(&workshop, "secure_token"), None);
+    }
+
+    #[test]
+    fn session_cookie_store_inserts_and_builds_request_header() {
+        let store = SessionCookieStore::default();
+        let url = reqwest::Url::parse("https://example.com/").unwrap();
+        store
+            .insert(
+                &url,
+                "sessionid=abc; Domain=example.com; Path=/; Secure; SameSite=None",
+            )
+            .unwrap();
+
+        let cookies = ReqwestCookieStore::cookies(&store, &url)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(cookies, "sessionid=abc");
+    }
+
+    #[test]
+    fn injected_sessions_are_isolated_and_views_share_their_store() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SessionCookieStore>();
+
+        let (first, first_store) = session();
+        let first_view = LuaHttpClient::with_session(first.client.clone(), first_store);
+        let (second, _) = session();
+        let url = "https://example.com/";
+        first
+            .set_cookie(url, "sessionid=first; Domain=example.com; Path=/")
+            .unwrap();
+
+        assert_eq!(
+            first.cookie(url, "sessionid").unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            first_view.cookie(url, "sessionid").unwrap().as_deref(),
+            Some("first")
+        );
+        assert_eq!(second.cookie(url, "sessionid").unwrap(), None);
+    }
+
+    #[test]
+    fn cookie_snapshot_round_trip_tracks_revision_and_drops_expired_entries() {
+        let store = SessionCookieStore::default();
+        let url = reqwest::Url::parse("https://example.com/").unwrap();
+        store
+            .insert(&url, "session=ready; Domain=example.com; Path=/; Secure")
+            .unwrap();
+        let revision = store.revision();
+        assert!(store.is_dirty());
+
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.revision, revision);
+        assert!(store.mark_clean(snapshot.revision));
+        assert!(!store.is_dirty());
+
+        store
+            .insert(&url, "obsolete=value; Domain=example.com; Path=/")
+            .unwrap();
+        store
+            .insert(&url, "obsolete=gone; Domain=example.com; Path=/; Max-Age=0")
+            .unwrap();
+        assert!(store.is_dirty());
+        let snapshot_without_expired = store.snapshot().unwrap();
+
+        let restored = SessionCookieStore::default();
+        restored.restore(&snapshot.value).unwrap();
+        assert_eq!(restored.cookie(&url, "session").as_deref(), Some("ready"));
+        assert_eq!(restored.cookie(&url, "expired"), None);
+        assert!(!restored.is_dirty());
+
+        let restored_without_expired = SessionCookieStore::default();
+        restored_without_expired
+            .restore(&snapshot_without_expired.value)
+            .unwrap();
+        assert_eq!(restored_without_expired.cookie(&url, "obsolete"), None);
+    }
+
+    #[test]
+    fn multipart_accepts_scalar_lua_fields() {
+        let lua = Lua::new();
+        let values = lua.create_table().unwrap();
+        values.set("nonce", "token").unwrap();
+        values.set("attempt", 1).unwrap();
+        let form = table_to_multipart_form(&values).unwrap();
+        let request = reqwest::Client::new()
+            .post("https://example.com")
+            .multipart(form)
+            .build()
+            .unwrap();
+
+        assert!(request.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("multipart/form-data; boundary="));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_follows_redirects_and_returns_stored_cookies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let response = match index {
+                    0 => {
+                        assert!(request.starts_with("GET /start "));
+                        "HTTP/1.1 302 Found\r\nLocation: /finish\r\nSet-Cookie: redirected=yes; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                    1 => {
+                        assert!(request.starts_with("GET /finish "));
+                        assert!(request.contains("redirected=yes"));
+                        "HTTP/1.1 200 OK\r\nSet-Cookie: session=ready; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                    _ => {
+                        assert!(request.starts_with("GET /check "));
+                        assert!(request.contains("redirected=yes"));
+                        assert!(request.contains("session=ready"));
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let (session, _) = session();
+        let start = format!("http://{address}/start");
+        let response = session.get(start).send().await.unwrap();
+        assert_eq!(response.0.as_ref().unwrap().url().path(), "/finish");
+        let root = format!("http://{address}/");
+        assert_eq!(
+            session.cookie(&root, "redirected").unwrap().as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            session.cookie(&root, "session").unwrap().as_deref(),
+            Some("ready")
+        );
+
+        session
+            .get(format!("http://{address}/check"))
+            .send()
+            .await
+            .unwrap();
+        server.join().unwrap();
+    }
 }
