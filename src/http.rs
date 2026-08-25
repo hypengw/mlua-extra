@@ -439,6 +439,21 @@ impl LuaUserData for LuaRequest {
 
 pub struct LuaResponse(pub Option<reqwest::Response>);
 
+pub const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_BYTES: usize = 32 * 1024 * 1024;
+
+// Stream the body, stopping before it exceeds `cap` decoded bytes.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> LuaResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(mlua::Error::external)? {
+        if chunk.len() > cap - buf.len() {
+            return Err(mlua::Error::external("response body exceeds limit"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 impl LuaUserData for LuaResponse {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("status", |_, this, ()| {
@@ -459,31 +474,21 @@ impl LuaUserData for LuaResponse {
             None => lua.create_table(),
         });
         methods.add_async_method_mut("text", |_, mut this, ()| async move {
-            this.0
-                .take()
-                .ok_or(mlua::Error::UserDataBorrowError)?
-                .text()
-                .await
-                .map_err(mlua::Error::external)
+            let resp = this.0.take().ok_or(mlua::Error::UserDataBorrowError)?;
+            let bytes = read_capped(resp, MAX_TEXT_BYTES).await?;
+            // Lossy like reqwest's text(): never reject on invalid UTF-8.
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
         });
         methods.add_async_method_mut("bytes", |lua, mut this, ()| async move {
-            let bytes = this
-                .0
-                .take()
-                .ok_or(mlua::Error::UserDataBorrowError)?
-                .bytes()
-                .await
-                .map_err(mlua::Error::external)?;
+            let resp = this.0.take().ok_or(mlua::Error::UserDataBorrowError)?;
+            let bytes = read_capped(resp, MAX_BYTES).await?;
             lua.create_string(bytes)
         });
         methods.add_async_method_mut("json", |lua, mut this, ()| async move {
-            let value: serde_json::Value = this
-                .0
-                .take()
-                .ok_or(mlua::Error::UserDataBorrowError)?
-                .json()
-                .await
-                .map_err(mlua::Error::external)?;
+            let resp = this.0.take().ok_or(mlua::Error::UserDataBorrowError)?;
+            let bytes = read_capped(resp, MAX_TEXT_BYTES).await?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(mlua::Error::external)?;
             to_lua(&lua, &value)
         });
     }
@@ -715,6 +720,59 @@ mod tests {
             .send()
             .await
             .unwrap();
+        server.join().unwrap();
+    }
+
+    fn serve_body(body: Vec<u8>) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap_or(0);
+                if count == 0 {
+                    break;
+                }
+                if buffer[..count].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        (address, handle)
+    }
+
+    async fn fetch_raw(address: std::net::SocketAddr) -> reqwest::Response {
+        let (session, _) = session();
+        session
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap()
+            .0
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_capped_rejects_body_over_cap() {
+        let (address, server) = serve_body(vec![b'x'; 4096]);
+        let resp = fetch_raw(address).await;
+        assert!(read_capped(resp, 1000).await.is_err());
+        let _ = server.join();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_capped_passes_body_through_under_cap() {
+        let (address, server) = serve_body(b"hello world".to_vec());
+        let resp = fetch_raw(address).await;
+        let bytes = read_capped(resp, 1_000_000).await.unwrap();
+        assert_eq!(bytes, b"hello world");
         server.join().unwrap();
     }
 }
