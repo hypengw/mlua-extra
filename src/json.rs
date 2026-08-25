@@ -1,7 +1,14 @@
 use crate::util::to_lua;
 use mlua::prelude::*;
 
+pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn parse(lua: &Lua, value: &str) -> LuaResult<LuaValue> {
+    if value.len() > MAX_INPUT_BYTES {
+        return Err(LuaError::external(format!(
+            "json input exceeds {MAX_INPUT_BYTES}-byte limit"
+        )));
+    }
     match serde_json::from_str::<serde_json::Value>(value) {
         Ok(value) => json_to_lua(lua, &value),
         Err(_) => Ok(LuaValue::Nil),
@@ -36,8 +43,13 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     t.set(
         "decode",
         lua.create_function(|lua, s: String| {
+            if s.len() > MAX_INPUT_BYTES {
+                return Err(mlua::Error::external(format!(
+                    "json input exceeds {MAX_INPUT_BYTES}-byte limit"
+                )));
+            }
             let v: serde_json::Value = serde_json::from_str(&s).map_err(mlua::Error::external)?;
-            to_lua(&lua, &v)
+            to_lua(lua, &v)
         })?,
     )?;
     Ok(t)
@@ -149,5 +161,21 @@ mod tests {
             .unwrap();
         assert!(matches!(parsed, LuaValue::Nil));
         assert!(matches!(encoded, LuaValue::Nil));
+    }
+
+    #[test]
+    fn parse_rejects_oversized_input() {
+        let lua = Lua::new();
+        let over = "a".repeat(MAX_INPUT_BYTES + 1);
+        assert!(parse(&lua, &over).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_oversized_input() {
+        let lua = Lua::new();
+        let module = create_module(&lua).unwrap();
+        let decode = module.get::<LuaFunction>("decode").unwrap();
+        let over = "a".repeat(MAX_INPUT_BYTES + 1);
+        assert!(decode.call::<LuaValue>(over).is_err());
     }
 }
