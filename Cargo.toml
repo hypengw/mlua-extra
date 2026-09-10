@@ -5,9 +5,12 @@ edition = "2021"
 description = "Neutral mlua bindings."
 license = "MIT"
 
+[features]
+vendored-lua = ["mlua/vendored"]
+
 [dependencies]
 base64 = "0.22"
-mlua = { version = "0.10", features = ["lua54", "vendored", "send", "async", "serialize"] }
+mlua = { version = "0.10", features = ["lua54", "send", "async", "serialize"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "cookies",
     "rustls-tls",
