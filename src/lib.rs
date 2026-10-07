@@ -1,4 +1,5 @@
 pub mod base64;
+pub mod error;
 pub mod html;
 pub mod http;
 pub mod json;

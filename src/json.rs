@@ -1,3 +1,4 @@
+pub mod strict;
 use crate::util::to_lua;
 use mlua::prelude::*;
 
@@ -27,6 +28,7 @@ pub fn create_nullable_module(lua: &Lua) -> LuaResult<LuaTable> {
 
 pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
+    t.set("strict", strict::create_module(lua)?)?;
     t.set(
         "encode",
         lua.create_function(|_, v: LuaValue| {

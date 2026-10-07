@@ -4,6 +4,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
     t.set(
+        "parse_rfc3339",
+        lua.create_function(|_, value: String| {
+            chrono::DateTime::parse_from_rfc3339(&value)
+                .map(|v| v.timestamp_millis())
+                .map_err(LuaError::external)
+        })?,
+    )?;
+    t.set(
         "now",
         lua.create_function(|_, ()| {
             let millis = SystemTime::now()
@@ -36,6 +44,20 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parses_rfc3339_in_milliseconds() {
+        let lua = Lua::new();
+        let parse = create_module(&lua)
+            .unwrap()
+            .get::<LuaFunction>("parse_rfc3339")
+            .unwrap();
+        assert_eq!(
+            parse.call::<i64>("1970-01-01T01:00:01.123+01:00").unwrap(),
+            1123
+        );
+        assert_eq!(parse.call::<i64>("1969-12-31T23:59:59Z").unwrap(), -1000);
+        assert!(parse.call::<i64>("not a date").is_err());
+    }
     #[test]
     fn exposes_millisecond_and_second_timestamps() {
         let lua = Lua::new();

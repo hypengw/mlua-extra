@@ -3,6 +3,21 @@ use url::Url;
 
 pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
+    t.set(
+        "encode_path_segment",
+        lua.create_function(|_, value: LuaString| Ok(encode_path_segment(&value.as_bytes())))?,
+    )?;
+    t.set(
+        "encode_query_pairs",
+        lua.create_function(|_, values: LuaTable| {
+            serde_urlencoded::to_string(crate::http::string_pairs(&values)?)
+                .map_err(LuaError::external)
+        })?,
+    )?;
+    t.set(
+        "append_api_path",
+        lua.create_function(|_, (base, path): (String, String)| append_api_path(&base, &path))?,
+    )?;
 
     t.set(
         "encode",
@@ -84,4 +99,71 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     )?;
 
     Ok(t)
+}
+
+pub fn encode_path_segment(value: &[u8]) -> String {
+    let mut out = String::new();
+    for &byte in value {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(out, "%{byte:02X}").unwrap();
+        }
+    }
+    out
+}
+
+pub fn append_api_path(base: &str, path: &str) -> LuaResult<String> {
+    let mut url = Url::parse(base).map_err(LuaError::external)?;
+    let normalized = path
+        .to_ascii_lowercase()
+        .replace("%2e", ".")
+        .replace("%5c", "\\");
+    if !matches!(url.scheme(), "http" | "https")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || path.starts_with("//")
+        || path.contains(['?', '#'])
+        || normalized.contains('\\')
+        || normalized
+            .split('/')
+            .any(|part| part == "." || part == "..")
+    {
+        return Err(crate::error::Error::lua(
+            "url",
+            "invalid_path",
+            "expected an API path without authority, query, fragment or dot segments",
+        ));
+    }
+    let combined = format!(
+        "{}/{}",
+        url.path().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    url.set_path(&combined);
+    Ok(url.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn api_path_preserves_prefix_and_encoded_segments() {
+        assert_eq!(encode_path_segment(b"a/b +~"), "a%2Fb%20%2B~");
+        assert_eq!(
+            append_api_path("https://example.com/jellyfin/", "/Items/a%2Fb").unwrap(),
+            "https://example.com/jellyfin/Items/a%2Fb"
+        );
+        for path in [
+            "//evil.com/items",
+            "../items",
+            "/%2E%2e/items",
+            "/x?token=y",
+            "/x#z",
+            "/x\\y",
+        ] {
+            assert!(append_api_path("https://example.com/jellyfin", path).is_err());
+        }
+    }
 }
