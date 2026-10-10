@@ -555,6 +555,14 @@ impl LuaRequestBuilder {
         Ok(req)
     }
 
+    /// Transfers a request for host-managed streaming and response processing.
+    pub fn take_parts(
+        &mut self,
+    ) -> LuaResult<(reqwest::Client, reqwest::Request, Option<Duration>)> {
+        let prepared = self.prepare()?;
+        Ok((prepared.client, prepared.request, prepared.headers_timeout))
+    }
+
     fn prepare(&mut self) -> LuaResult<PreparedRequest> {
         let (mut client, request) = self.build_split()?;
         if self.headers_timeout.is_some() {
@@ -749,6 +757,19 @@ impl LuaUserData for LuaRequestBuilder {
 
 pub struct LuaRequest(Option<PreparedRequest>);
 
+impl LuaRequest {
+    /// Transfers a request for host-managed streaming and response processing.
+    pub fn take_parts(
+        &mut self,
+    ) -> LuaResult<(reqwest::Client, reqwest::Request, Option<Duration>)> {
+        let prepared = self
+            .0
+            .take()
+            .ok_or_else(|| http_error("consumed", "request already consumed"))?;
+        Ok((prepared.client, prepared.request, prepared.headers_timeout))
+    }
+}
+
 struct PreparedRequest {
     client: reqwest::Client,
     request: reqwest::Request,
@@ -831,8 +852,10 @@ fn merge_cookie_header(stored_cookie: &str, req_cookie: &str) -> String {
             cookie_map.insert(key.trim().to_owned(), value.trim().to_owned());
         }
     }
-    cookie_map
-        .iter()
+    let mut pairs: Vec<_> = cookie_map.iter().collect();
+    pairs.sort_by_key(|(key, _)| *key);
+    pairs
+        .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect::<Vec<_>>()
         .join("; ")
@@ -843,6 +866,43 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn prepared_request_parts_preserve_headers_timeout_and_consumption() {
+        let lua = Lua::new();
+        let client = reqwest::Client::new();
+        lua.globals()
+            .set(
+                "http",
+                LuaHttpClient::new(client.clone()).with_stream_client(client),
+            )
+            .unwrap();
+        let ud=lua.load(r#"return http:get('https://example.invalid/media'):header_pairs{{'If-None-Match','"one"'}}:stream{headers_timeout_ms=1234}:build()"#).eval::<LuaAnyUserData>().unwrap();
+        let mut request = ud.borrow_mut::<LuaRequest>().unwrap();
+        let (_, request_value, timeout) = request.take_parts().unwrap();
+        assert_eq!(request_value.headers()["if-none-match"], "\"one\"");
+        assert_eq!(timeout, Some(Duration::from_millis(1234)));
+        assert!(request.take_parts().is_err());
+        let ud = lua
+            .load(
+                "return http:get('https://example.invalid/media'):stream{headers_timeout_ms=4321}",
+            )
+            .eval::<LuaAnyUserData>()
+            .unwrap();
+        let mut builder = ud.borrow_mut::<LuaRequestBuilder>().unwrap();
+        assert_eq!(
+            builder.take_parts().unwrap().2,
+            Some(Duration::from_millis(4321))
+        );
+        assert!(builder.take_parts().is_err());
+    }
+
+    #[test]
+    fn merged_cookies_have_stable_order_and_request_precedence() {
+        for _ in 0..16 {
+            assert_eq!(merge_cookie_header("b=2; a=1", "b=3; c=4"), "a=1; b=3; c=4");
+        }
+    }
 
     fn header(value: &str) -> HeaderValue {
         HeaderValue::from_str(value).unwrap()
