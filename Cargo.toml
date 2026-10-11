@@ -6,6 +6,9 @@ description = "Neutral mlua bindings."
 license = "MIT"
 
 [features]
+default = ["rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
 vendored-lua = ["mlua/vendored"]
 
 [dependencies]
@@ -13,7 +16,6 @@ base64 = "0.22"
 mlua = { version = "0.10", features = ["lua54", "send", "async", "serialize"] }
 reqwest = { version = "0.12", default-features = false, features = [
     "cookies",
-    "rustls-tls",
     "gzip",
     "json",
     "multipart",
