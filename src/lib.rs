@@ -7,3 +7,4 @@ pub mod random;
 pub mod time;
 pub mod url;
 pub mod util;
+pub mod xml;
