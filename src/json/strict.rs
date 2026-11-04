@@ -222,6 +222,35 @@ fn value_to_json(
 
 pub fn encode(value: &LuaValue) -> LuaResult<Vec<u8>> {
     let value = value_to_json(value, 0, &mut Budget::default(), &mut HashSet::new())?;
+    write_json(&value)
+}
+
+fn normalize_canonical(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) if number.is_f64() => {
+            let value = number.as_f64().unwrap();
+            if value.fract() == 0.0 && value.abs() <= 9_007_199_254_740_991.0 {
+                *number = (value as i64).into();
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(normalize_canonical),
+        serde_json::Value::Object(values) => {
+            values.values_mut().for_each(normalize_canonical);
+            values.sort_keys();
+        }
+        _ => {}
+    }
+}
+
+/// Sorts object keys and normalizes zero and safe integral floats, without rounding other numbers.
+/// Preserves integer precision; this is not a full RFC 8785 implementation.
+pub fn encode_canonical(value: &LuaValue) -> LuaResult<Vec<u8>> {
+    let mut value = value_to_json(value, 0, &mut Budget::default(), &mut HashSet::new())?;
+    normalize_canonical(&mut value);
+    write_json(&value)
+}
+
+fn write_json(value: &serde_json::Value) -> LuaResult<Vec<u8>> {
     struct Output(Vec<u8>);
     impl std::io::Write for Output {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -236,7 +265,7 @@ pub fn encode(value: &LuaValue) -> LuaResult<Vec<u8>> {
         }
     }
     let mut out = Output(Vec::new());
-    serde_json::to_writer(&mut out, &value).map_err(|e| error("limit", e.to_string()))?;
+    serde_json::to_writer(&mut out, value).map_err(|e| error("limit", e.to_string()))?;
     Ok(out.0)
 }
 
@@ -267,6 +296,10 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
     module.set(
         "encode",
         lua.create_function(|lua, value: LuaValue| lua.create_string(encode(&value)?))?,
+    )?;
+    module.set(
+        "encode_canonical",
+        lua.create_function(|lua, value: LuaValue| lua.create_string(encode_canonical(&value)?))?,
     )?;
     module.set(
         "decode",
@@ -306,11 +339,47 @@ mod tests {
             end
             for _, v in ipairs({{}, {[2]=1}, {[1]=1, a=2}, 0/0, math.huge, 1e20, J.array{a=1}, J.object{1}}) do
                 assert(not pcall(J.encode, v))
+                assert(not pcall(J.encode_canonical, v))
             end
             local cycle = {}; cycle.a = cycle
             assert(not pcall(J.encode, cycle))
+            assert(not pcall(J.encode_canonical, cycle))
             assert(not pcall(J.encode, nil))
+            assert(not pcall(J.encode_canonical, nil))
             assert(not pcall(J.decode, string.rep('[', 66)..'0'..string.rep(']', 66)))
         "#).exec().unwrap();
+    }
+
+    #[test]
+    fn strict_canonical_encoding_is_stable_without_changing_regular_encoding() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("J", create_module(&lua).unwrap())
+            .unwrap();
+        lua.load(
+            r#"
+            local a = J.decode('{"z":-0.0,"a":{"y":1.0,"x":[]},"n":null,"f":false}')
+            local b = J.decode('{"f":false,"n":null,"a":{"x":[],"y":1},"z":0}')
+            local expected = '{"a":{"x":[],"y":1},"f":false,"n":null,"z":0}'
+            assert(J.encode_canonical(a) == expected)
+            assert(J.encode_canonical(b) == expected)
+            assert(J.encode_canonical(J.decode(J.encode(a))) == expected)
+            assert(J.encode_canonical(J.decode(J.encode_canonical(a))) == expected)
+            assert(J.encode(J.decode('1.0')) == '1.0')
+            assert(J.encode(J.decode('-0.0')) == '-0.0')
+            assert(J.encode_canonical(J.decode('9223372036854775807')) == '9223372036854775807')
+            assert(J.encode_canonical(J.decode('9007199254740991.0')) == '9007199254740991')
+            local precise = J.decode('[0.1234567890123456,1.5e-30]')
+            assert(J.encode_canonical(precise) == J.encode(precise))
+            local inserted = J.object{}
+            inserted.z = 0.0
+            inserted.a = J.object{y=1.0,x=J.array{}}
+            inserted.n = J.null
+            inserted.f = false
+            assert(J.encode_canonical(inserted) == expected)
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 }
