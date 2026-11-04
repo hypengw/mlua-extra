@@ -8,6 +8,12 @@ pub fn create_module(lua: &Lua) -> LuaResult<LuaTable> {
         lua.create_function(|_, value: LuaString| Ok(encode_path_segment(&value.as_bytes())))?,
     )?;
     t.set(
+        "percent_decode",
+        lua.create_function(|lua, value: LuaString| {
+            lua.create_string(percent_decode(&value.as_bytes())?)
+        })?,
+    )?;
+    t.set(
         "encode_query_pairs",
         lua.create_function(|_, values: LuaTable| {
             serde_urlencoded::to_string(crate::http::string_pairs(&values)?)
@@ -114,6 +120,24 @@ pub fn encode_path_segment(value: &[u8]) -> String {
     out
 }
 
+/// Decode percent escapes once into bytes, preserving '+'. Invalid escapes are errors.
+pub fn percent_decode(value: &[u8]) -> LuaResult<Vec<u8>> {
+    let mut bytes = value.iter();
+    while let Some(byte) = bytes.next() {
+        if *byte == b'%'
+            && (!bytes.next().is_some_and(u8::is_ascii_hexdigit)
+                || !bytes.next().is_some_and(u8::is_ascii_hexdigit))
+        {
+            return Err(crate::error::Error::lua(
+                "url",
+                "invalid_escape",
+                "expected two hexadecimal digits after '%'",
+            ));
+        }
+    }
+    Ok(percent_encoding::percent_decode(value).collect())
+}
+
 pub fn append_api_path(base: &str, path: &str) -> LuaResult<String> {
     let mut url = Url::parse(base).map_err(LuaError::external)?;
     let normalized = path
@@ -148,6 +172,36 @@ pub fn append_api_path(base: &str, path: &str) -> LuaResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decoding_preserves_bytes_and_requires_valid_escapes() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("url", create_module(&lua).unwrap())
+            .unwrap();
+        lua.globals()
+            .set("error_info", crate::error::create_module(&lua).unwrap())
+            .unwrap();
+        lua.load(
+            r#"
+            assert(url.percent_decode('/a%2Fb+%E4%B8%AD') == '/a/b+中')
+            assert(url.percent_decode('/a%252Fb%2b') == '/a%2Fb+')
+            assert(url.percent_decode('/already/中+') == '/already/中+')
+            assert(url.percent_decode('/%FF%00%E4%B8') == '/' .. string.char(255, 0, 228, 184))
+            local bytes = '/' .. string.char(255, 0, 228, 184)
+            assert(url.percent_decode(bytes) == bytes)
+            for _, value in ipairs({'/%', '/%2', '/%G0', '/%0G', '/%２0'}) do
+                local ok, err = pcall(url.percent_decode, value)
+                assert(not ok)
+                local info = error_info.inspect(err)
+                assert(info.domain == 'url' and info.code == 'invalid_escape')
+            end
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
     #[test]
     fn api_path_preserves_prefix_and_encoded_segments() {
         assert_eq!(encode_path_segment(b"a/b +~"), "a%2Fb%20%2B~");

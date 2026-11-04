@@ -1,7 +1,10 @@
 use super::{header_map_to_table, http_error, BodyOptions};
 use crate::util::to_lua;
 use mlua::prelude::*;
-use reqwest::header::HeaderMap;
+use reqwest::{
+    header::{HeaderMap, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING},
+    ResponseBuilderExt,
+};
 use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
@@ -25,7 +28,65 @@ pub struct LuaResponse {
 struct ReadGuard(Arc<AtomicU8>);
 impl Drop for ReadGuard {
     fn drop(&mut self) {
-        self.0.store(CONSUMED, Ordering::Release);
+        let _ = self
+            .0
+            .compare_exchange(READING, CONSUMED, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+struct ResponseParts {
+    head: http::response::Parts,
+    url: reqwest::Url,
+    options: BodyOptions,
+}
+
+struct LuaResponseParts(Option<ResponseParts>);
+impl LuaResponseParts {
+    fn from_response(response: reqwest::Response, options: BodyOptions) -> Self {
+        let url = response.url().clone();
+        let response: http::Response<reqwest::Body> = response.into();
+        let (head, _) = response.into_parts();
+        Self(Some(ResponseParts { head, url, options }))
+    }
+
+    fn with_body(&mut self, body: LuaValue) -> LuaResult<LuaResponse> {
+        let parts = self
+            .0
+            .as_ref()
+            .ok_or_else(|| http_error("consumed", "response parts have already been consumed"))?;
+        let LuaValue::String(body) = body else {
+            return Err(http_error(
+                "invalid_argument",
+                "response body must be a string",
+            ));
+        };
+        let body = body.as_bytes();
+        if parts.options.limit.is_some_and(|limit| body.len() > limit) {
+            return Err(http_error(
+                "limit",
+                "replacement response body exceeds byte limit",
+            ));
+        }
+        let length = HeaderValue::from_str(&body.len().to_string()).map_err(LuaError::external)?;
+        let body = body.to_vec();
+        let parts = self.0.take().unwrap();
+        let mut response = http::Response::builder()
+            .status(parts.head.status)
+            .version(parts.head.version)
+            .url(parts.url)
+            .body(body)
+            .map_err(LuaError::external)?;
+        *response.headers_mut() = parts.head.headers;
+        response.headers_mut().remove(TRANSFER_ENCODING);
+        response.headers_mut().insert(CONTENT_LENGTH, length);
+        response.extensions_mut().extend(parts.head.extensions);
+        Ok(LuaResponse::with_options(response.into(), parts.options))
+    }
+}
+
+impl LuaUserData for LuaResponseParts {
+    fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("with_body", |_, this, body: LuaValue| this.with_body(body));
     }
 }
 
@@ -87,6 +148,7 @@ impl LuaResponse {
     fn read(
         &mut self,
         opts: Option<LuaTable>,
+        preserve_codec: bool,
     ) -> LuaResult<(
         reqwest::Response,
         ReadGuard,
@@ -97,6 +159,12 @@ impl LuaResponse {
         let mut timeout = None;
         if let Some(opts) = opts {
             if let Some(codec) = opts.get::<Option<String>>("codec")? {
+                if preserve_codec {
+                    return Err(http_error(
+                        "invalid_argument",
+                        "response parts preserve the response JSON codec",
+                    ));
+                }
                 options.strict = super::parse_codec(&codec)?;
             }
             if let Some(limit) = opts.get::<Option<usize>>("max_bytes")? {
@@ -122,23 +190,28 @@ impl LuaResponse {
     }
 }
 
-async fn read_body(
+async fn read_bytes(response: &mut reqwest::Response, options: BodyOptions) -> LuaResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(super::transport_error)? {
+        if options
+            .limit
+            .is_some_and(|limit| bytes.len().saturating_add(chunk.len()) > limit)
+        {
+            return Err(http_error("limit", "response body exceeds byte limit"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn buffer_body(
     mut response: reqwest::Response,
     options: BodyOptions,
     timeout: Option<std::time::Duration>,
-) -> LuaResult<Vec<u8>> {
+) -> LuaResult<(reqwest::Response, Vec<u8>)> {
     let read = async move {
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(super::transport_error)? {
-            if options
-                .limit
-                .is_some_and(|limit| bytes.len().saturating_add(chunk.len()) > limit)
-            {
-                return Err(http_error("limit", "response body exceeds byte limit"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        let bytes = read_bytes(&mut response, options).await?;
+        Ok((response, bytes))
     };
     match timeout {
         Some(timeout) => tokio::time::timeout(timeout, read)
@@ -177,6 +250,18 @@ impl LuaUserData for LuaResponse {
         });
         methods.add_method("body_state", |_, this, ()| Ok(this.body_state()));
         methods.add_method_mut("close", |_, this, ()| this.close());
+        methods.add_async_function(
+            "read_body",
+            |lua, (ud, opts): (LuaAnyUserData, Option<LuaTable>)| async move {
+                let (response, _guard, options, timeout) =
+                    ud.borrow_mut::<LuaResponse>()?.read(opts, true)?;
+                let (response, bytes) = buffer_body(response, options, timeout).await?;
+                Ok((
+                    LuaResponseParts::from_response(response, options),
+                    lua.create_string(bytes)?,
+                ))
+            },
+        );
         for mode in ["bytes", "text", "json"] {
             methods.add_async_function(
                 mode,
@@ -188,8 +273,8 @@ impl LuaUserData for LuaResponse {
                         .flatten()
                         .unwrap_or(false);
                     let (response, _guard, options, timeout) =
-                        ud.borrow_mut::<LuaResponse>()?.read(opts)?;
-                    let bytes = read_body(response, options, timeout).await?;
+                        ud.borrow_mut::<LuaResponse>()?.read(opts, false)?;
+                    let (_, bytes) = buffer_body(response, options, timeout).await?;
                     match mode {
                         "json" if options.strict => crate::json::strict::decode(&lua, &bytes),
                         "json" => {
@@ -214,3 +299,7 @@ impl LuaUserData for LuaResponse {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "response_tests.rs"]
+mod tests;

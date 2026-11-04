@@ -9,11 +9,15 @@
 ---@field header_pairs fun(self: MluaHttpResponse): string[][]
 ---@field body_state fun(self: MluaHttpResponse): string
 ---@field bytes fun(self: MluaHttpResponse, options?: {max_bytes?: integer, timeout_ms?: integer}): string
+---@field read_body fun(self: MluaHttpResponse, options?: {max_bytes?: integer, timeout_ms?: integer}): MluaHttpResponseParts, string
 ---@field status fun(self: MluaHttpResponse): integer
 ---@field header_values fun(self: MluaHttpResponse, name: string): string[]
 ---@field close fun(self: MluaHttpResponse)
 ---@field json fun(self: MluaHttpResponse, options?: {codec?: string, max_bytes?: integer, timeout_ms?: integer}): any
 ---@field text fun(self: MluaHttpResponse, options?: {max_bytes?: integer, timeout_ms?: integer}): string
+
+---@class MluaHttpResponseParts
+---@field with_body fun(self: MluaHttpResponseParts, body: string): MluaHttpResponse
 
 ---@class MluaHttpBuilder
 ---@field json_codec fun(self: MluaHttpBuilder, codec: string): MluaHttpBuilder

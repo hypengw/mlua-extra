@@ -965,28 +965,64 @@ mod tests {
         assert_eq!(cookies, "sessionid=abc");
     }
 
+    fn request_with_cookie(client: LuaHttpClient, url: &str, cookie: &str) -> reqwest::Request {
+        let lua = Lua::new();
+        lua.globals().set("http", client).unwrap();
+        lua.globals().set("url", url).unwrap();
+        lua.globals().set("cookie", cookie).unwrap();
+        let request = lua
+            .load("return http:get(url):header('Cookie', cookie):build()")
+            .eval::<LuaAnyUserData>()
+            .unwrap();
+        take_request(&request).unwrap().request
+    }
+
     #[test]
     fn injected_sessions_are_isolated_and_views_share_their_store() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SessionCookieStore>();
 
         let (first, first_store) = session();
-        let first_view = LuaHttpClient::with_session(first.client.clone(), first_store);
+        let first_view = LuaHttpClient::with_session(first.client.clone(), first_store.clone());
         let (second, _) = session();
-        let url = "https://example.com/";
-        first
-            .set_cookie(url, "sessionid=first; Domain=example.com; Path=/")
+        let url = reqwest::Url::parse("https://example.com/").unwrap();
+        first_store
+            .insert(&url, "sessionid=first; Domain=example.com; Path=/")
             .unwrap();
+        for client in [first, first_view] {
+            let request = request_with_cookie(client, url.as_str(), "explicit=value");
+            assert_eq!(request.headers()[header::COOKIE], "explicit=value; sessionid=first");
+        }
+        let request = request_with_cookie(second, url.as_str(), "explicit=value");
+        assert_eq!(request.headers()[header::COOKIE], "explicit=value");
+    }
 
-        assert_eq!(
-            first.cookie(url, "sessionid").unwrap().as_deref(),
-            Some("first")
-        );
-        assert_eq!(
-            first_view.cookie(url, "sessionid").unwrap().as_deref(),
-            Some("first")
-        );
-        assert_eq!(second.cookie(url, "sessionid").unwrap(), None);
+    #[test]
+    fn session_cookie_methods_use_its_own_store() {
+        let (client, store) = session();
+        let lua = Lua::new();
+        lua.globals().set("http", client).unwrap();
+        lua.load(r#"
+            local url = 'https://example.com/'
+            http:set_cookie(url, 'session=ready; Path=/; Secure')
+            assert(http:cookie(url, 'session') == 'ready')
+            assert(http:cookie('http://example.com/', 'session') == nil)
+            http:clear_cookies()
+            assert(http:cookie(url, 'session') == nil)
+        "#).exec().unwrap();
+        assert!(store.cookie(&reqwest::Url::parse("https://example.com/").unwrap(), "session").is_none());
+    }
+
+    #[test]
+    fn header_only_cookie_provider_merges_explicit_headers_without_mutating_store() {
+        let store = Arc::new(SessionCookieStore::default());
+        let url = reqwest::Url::parse("https://example.com/").unwrap();
+        store.insert(&url, "kept=ready; Path=/").unwrap();
+        let http = LuaHttpClient::with_cookie_provider(reqwest::Client::new(), store.clone());
+        let request = request_with_cookie(http, url.as_str(), "kept=override; other=value");
+        assert_eq!(request.headers()[header::COOKIE], "kept=override; other=value");
+        assert_eq!(store.cookie(&url, "kept").as_deref(), Some("ready"));
+        assert_eq!(store.cookie(&url, "other"), None);
     }
 
     #[test]
@@ -1046,7 +1082,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_follows_redirects_and_returns_stored_cookies() {
+    async fn session_follows_redirects_and_merges_stored_cookies() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1078,7 +1114,9 @@ mod tests {
                     _ => {
                         assert!(request.starts_with("GET /check "));
                         assert!(request.contains("redirected=yes"));
-                        assert!(request.contains("session=ready"));
+                        assert!(request.contains("session=override"));
+                        assert!(request.contains("custom=extra"));
+                        assert!(!request.contains("session=ready"));
                         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     }
                 };
@@ -1086,25 +1124,30 @@ mod tests {
             }
         });
 
-        let (session, _) = session();
+        let (session, store) = session();
         let start = format!("http://{address}/start");
         let response = session.get(start).send().await.unwrap();
         assert_eq!(response.url().path(), "/finish");
-        let root = format!("http://{address}/");
+        let root = reqwest::Url::parse(&format!("http://{address}/")).unwrap();
         assert_eq!(
-            session.cookie(&root, "redirected").unwrap().as_deref(),
+            store.cookie(&root, "redirected").as_deref(),
             Some("yes")
         );
         assert_eq!(
-            session.cookie(&root, "session").unwrap().as_deref(),
+            store.cookie(&root, "session").as_deref(),
             Some("ready")
         );
 
-        session
-            .get(format!("http://{address}/check"))
+        let mut check = session.get(format!("http://{address}/check"));
+        check
+            .map(|builder| builder.header(header::COOKIE, "session=override; custom=extra"))
+            .unwrap();
+        check
             .send()
             .await
             .unwrap();
+        assert_eq!(store.cookie(&root, "session").as_deref(), Some("ready"));
+        assert_eq!(store.cookie(&root, "custom"), None);
         server.join().unwrap();
     }
 }
